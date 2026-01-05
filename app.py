@@ -245,7 +245,7 @@ with d1:
     else:
        fig = px.scatter(dd, x="rainfall_mm", y="net_generation_mwh",
                  title="Biomass: Rainfall vs Net Generation (weak relationship)")
-        st.plotly_chart(fig, use_container_width=True)
+       st.plotly_chart(fig, use_container_width=True)
 
 with d2:
     st.markdown("**Interpretation tips**")
