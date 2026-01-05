@@ -243,8 +243,8 @@ with d1:
                          title="Hydro: Rainfall vs Net Generation", trendline="ols")
         st.plotly_chart(fig, use_container_width=True)
     else:
-        fig = px.scatter(dd, x="rainfall_mm", y="net_generation_mwh",
-                         title="Biomass: Rainfall vs Net Generation (weak relationship)", trendline="ols")
+       fig = px.scatter(dd, x="rainfall_mm", y="net_generation_mwh",
+                 title="Biomass: Rainfall vs Net Generation (weak relationship)")
         st.plotly_chart(fig, use_container_width=True)
 
 with d2:
