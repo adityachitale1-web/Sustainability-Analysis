@@ -7,11 +7,11 @@ import plotly.express as px
 DATA_DIR = "data"
 WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-st.set_page_config(page_title="Green Energy Sustainability + ML Dashboard", layout="wide")
+st.set_page_config(page_title="Green Energy – Sustainability + ML Dashboard", layout="wide")
 
 
 # -----------------------------
-# Helpers (math / cleaning)
+# Helpers (math / formatting)
 # -----------------------------
 def safe_div(a, b):
     a = np.asarray(a, dtype="float64")
@@ -54,7 +54,7 @@ def add_outlier_flag(df: pd.DataFrame, col: str, group_cols=None, k: float = 1.5
 
 
 # -----------------------------
-# ML helpers (no sklearn)
+# ML helpers (no sklearn/scipy)
 # -----------------------------
 def sigmoid(z):
     z = np.clip(z, -50, 50)
@@ -89,7 +89,6 @@ def train_logreg(X, y, lr=0.1, steps=2000, reg=1e-3):
 
 
 def roc_curve_points(y_true, y_score):
-    # thresholds sorted high to low
     thresholds = np.unique(y_score)[::-1]
     tprs, fprs = [], []
     P = int((y_true == 1).sum())
@@ -134,6 +133,7 @@ def maybe_generate_data():
     ]
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
+
     missing = [f for f in required if not os.path.exists(os.path.join(DATA_DIR, f))]
     if missing:
         import generate_datasets
@@ -166,7 +166,9 @@ maybe_generate_data()
 plants, gen, grid, weather, ef = load_data()
 
 st.title("Green Energy – Sustainability + ML Dashboard")
-st.caption("Part-to-whole views, distributions, heatmaps, outliers, and a classifier (ROC/CM/feature importance) for high curtailment events.")
+st.caption(
+    "Part-to-whole views, distributions, heatmaps, outliers, business insights, and a classifier (ROC/CM/feature importance) for high curtailment events."
+)
 
 # -----------------------------
 # Sidebar filters
@@ -176,6 +178,7 @@ with st.sidebar:
 
     min_date = gen["date"].min().date()
     max_date = gen["date"].max().date()
+
     date_range = st.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start, end = date_range
@@ -211,28 +214,26 @@ mask = (
 )
 dff = gen.loc[mask].copy()
 
-# derived time features
 dff["month"] = dff["date"].dt.to_period("M").astype(str)
 dff["dow"] = pd.Categorical(dff["date"].dt.day_name(), categories=WEEKDAY_ORDER, ordered=True)
 
-# derived performance metrics
 dff["availability"] = (1 - dff["downtime_hours"] / 24.0).clip(0, 1)
 dff["capacity_factor"] = safe_div(dff["net_generation_mwh"], dff["capacity_mw"] * 24.0)
 dff["curtailment_rate"] = safe_div(dff["curtailment_mwh"], dff["gross_generation_mwh"])
 
-# merge grid intensity
+# Merge grid intensity
 dff = dff.merge(grid, on="date", how="left")
 
-# avoided CO2
+# Avoided CO2
 if baseline == "Grid_Average":
-    intensity_kg_per_kwh = dff["grid_intensity_gco2_per_kwh"] / 1000.0  # g->kg
+    intensity_kg_per_kwh = dff["grid_intensity_gco2_per_kwh"] / 1000.0
 else:
     factor = float(ef.loc[ef["baseline"] == baseline, "emission_factor_kgco2_per_kwh"].iloc[0])
     intensity_kg_per_kwh = factor
 
-dff["avoided_co2_tonnes"] = (dff["net_generation_mwh"] * 1000.0 * intensity_kg_per_kwh) / 1000.0  # kg->tonnes
+dff["avoided_co2_tonnes"] = (dff["net_generation_mwh"] * 1000.0 * intensity_kg_per_kwh) / 1000.0
 
-# outlier flags per technology
+# Outlier flags (per technology)
 dff = add_outlier_flag(dff, "net_generation_mwh", group_cols=["technology"], k=outlier_k)
 dff = add_outlier_flag(dff, "curtailment_rate", group_cols=["technology"], k=outlier_k)
 dff = add_outlier_flag(dff, "downtime_hours", group_cols=["technology"], k=outlier_k)
@@ -275,6 +276,82 @@ k9.metric("Outlier %", f"{outlier_pct:.2%}")
 st.markdown("---")
 
 # -----------------------------
+# Business insights (actionable)
+# -----------------------------
+st.subheader("Executive Business Insights (Actionable)")
+
+avg_price = float(dff_agg["price_per_mwh"].mean()) if len(dff_agg) else 0.0
+lost_mwh_curt = float(dff_agg["curtailment_mwh"].sum())
+estimated_lost_revenue = lost_mwh_curt * avg_price
+
+# Estimate downtime-related lost MWh by scaling net by availability (rough proxy)
+avail = dff_agg["availability"].clip(lower=0.05, upper=1.0)
+potential_net_if_no_downtime = float((dff_agg["net_generation_mwh"] / avail).sum())
+current_net = float(dff_agg["net_generation_mwh"].sum())
+lost_due_to_downtime_mwh = max(0.0, potential_net_if_no_downtime - current_net)
+
+downtime_reduction = st.slider("Assumed downtime reduction (%)", 0, 50, 20, 5) / 100.0
+recoverable_mwh = lost_due_to_downtime_mwh * downtime_reduction
+recoverable_revenue = recoverable_mwh * avg_price
+
+carbon_price = st.number_input("Carbon price (per tonne CO₂)", min_value=0.0, value=50.0, step=10.0)
+avoided_t = float(dff_agg["avoided_co2_tonnes"].sum())
+carbon_value = avoided_t * carbon_price
+
+plant_gen = (
+    dff_agg.groupby("plant_id", as_index=False)["net_generation_mwh"]
+    .sum()
+    .sort_values("net_generation_mwh", ascending=False)
+)
+top_n = st.slider("Top N plants for concentration check", 1, 5, 2)
+top_share = (plant_gen.head(top_n)["net_generation_mwh"].sum() / plant_gen["net_generation_mwh"].sum()) if len(plant_gen) else 0.0
+
+i1, i2, i3, i4 = st.columns(4)
+i1.metric("Estimated Lost Revenue (Curtailment)", f"{estimated_lost_revenue:,.0f}")
+i2.metric("Recoverable Revenue (Downtime reduction)", f"{recoverable_revenue:,.0f}")
+i3.metric("Avoided CO₂ Value (carbon price)", f"{carbon_value:,.0f}")
+i4.metric(f"Generation Concentration (Top {top_n} plants)", f"{top_share:.1%}")
+
+st.caption(
+    "Notes: Curtailment lost revenue uses average price. Downtime recovery assumes generation scales inversely with availability."
+)
+
+risk = dff_agg.groupby(["plant_id", "technology", "region"], as_index=False).agg(
+    net_generation_mwh=("net_generation_mwh", "sum"),
+    avg_capacity_factor=("capacity_factor", "mean"),
+    avg_availability=("availability", "mean"),
+    curtailment_mwh=("curtailment_mwh", "sum"),
+    gross_generation_mwh=("gross_generation_mwh", "sum"),
+    avg_downtime=("downtime_hours", "mean"),
+)
+risk["curtailment_rate"] = np.where(risk["gross_generation_mwh"] > 0, risk["curtailment_mwh"] / risk["gross_generation_mwh"], 0.0)
+
+# Simple risk score: higher is worse
+risk["risk_score"] = (
+    2.0 * risk["curtailment_rate"] +
+    1.0 * (1 - risk["avg_availability"]) +
+    1.0 * (1 - risk["avg_capacity_factor"])
+)
+
+st.markdown("### Plants to Review (highest risk score)")
+st.dataframe(
+    risk.sort_values("risk_score", ascending=False).head(10),
+    use_container_width=True,
+    hide_index=True
+)
+
+worst = risk.sort_values("risk_score", ascending=False).head(1)
+if len(worst):
+    row = worst.iloc[0]
+    st.info(
+        f"Recommendation: Prioritize investigation for **{row['plant_id']}** "
+        f"({row['technology']}, {row['region']}). "
+        f"It has a comparatively higher risk score driven by curtailment and/or availability and capacity factor."
+    )
+
+st.markdown("---")
+
+# -----------------------------
 # Part-to-whole (pie/donut)
 # -----------------------------
 st.subheader("Part-to-Whole Relationships (Portfolio Composition)")
@@ -283,7 +360,6 @@ mix_gen = dff_agg.groupby("technology", as_index=False)["net_generation_mwh"].su
 mix_rev = dff_agg.groupby("technology", as_index=False)["revenue"].sum()
 mix_co2 = dff_agg.groupby("technology", as_index=False)["avoided_co2_tonnes"].sum()
 mix_curt = dff_agg.groupby("technology", as_index=False)["curtailment_mwh"].sum()
-
 mix_region_gen = dff_agg.groupby("region", as_index=False)["net_generation_mwh"].sum()
 mix_region_curt = dff_agg.groupby("region", as_index=False)["curtailment_mwh"].sum()
 
@@ -379,7 +455,8 @@ t3, t4 = st.columns(2)
 with t3:
     st.plotly_chart(px.line(daily, x="date", y="revenue", title="Revenue (Daily)"), use_container_width=True)
 with t4:
-    st.plotly_chart(px.line(daily, x="date", y="avoided_co2_tonnes", title=f"Avoided CO₂ (Daily) – {baseline}"), use_container_width=True)
+    st.plotly_chart(px.line(daily, x="date", y="avoided_co2_tonnes", title=f"Avoided CO₂ (Daily) – {baseline}"),
+                    use_container_width=True)
 
 st.markdown("---")
 
@@ -467,14 +544,12 @@ st.markdown("---")
 # -----------------------------
 st.subheader("ML: Predict High Curtailment Events (ROC / Confusion Matrix / Feature Importance)")
 
-# Build modeling dataframe (join weather)
 model_df = dff_agg.merge(weather, on=["date", "region"], how="left").copy()
+model_df["curtailment_rate"] = safe_div(model_df["curtailment_mwh"], model_df["gross_generation_mwh"])
 
-# Label definition
 threshold = st.slider("High curtailment event threshold (curtailment rate)", 0.02, 0.20, 0.08, 0.01)
 model_df["high_curtailment_event"] = (model_df["curtailment_rate"] >= threshold).astype(int)
 
-# Feature set
 num_features = [
     "grid_intensity_gco2_per_kwh",
     "solar_irradiance_kwh_m2",
@@ -490,11 +565,9 @@ X_cat = pd.get_dummies(model_df[["technology", "region"]], drop_first=True)
 X = pd.concat([X_num, X_cat], axis=1)
 y = model_df["high_curtailment_event"].values.astype(int)
 
-# Enough data guardrails
 if len(X) < 200 or int(y.sum()) < 10 or int((y == 0).sum()) < 10:
     st.warning("Not enough rows/events in the current filters to train/evaluate the classifier. Expand date range / plants / regions.")
 else:
-    # Train/test split
     test_pct = st.slider("Test size (%)", 10, 40, 25, 5) / 100.0
     rng = np.random.default_rng(7)
     idx = np.arange(len(X))
@@ -507,25 +580,20 @@ else:
     y_train = y[train_idx]
     y_test = y[test_idx]
 
-    # Standardize
     X_train_s, mu, sigma = standardize(X_train)
     X_test_s = (X_test - mu) / sigma
 
-    # Train model
     lr = st.slider("Learning rate", 0.01, 0.5, 0.10, 0.01)
     steps = st.slider("Training steps", 500, 5000, 2000, 500)
     reg = st.slider("L2 regularization", 0.0, 0.01, 0.001, 0.001)
 
     w, b = train_logreg(X_train_s, y_train, lr=lr, steps=steps, reg=reg)
 
-    # Scores / predictions
     y_score = sigmoid(X_test_s @ w + b)
 
-    # ROC + AUC
     fpr, tpr = roc_curve_points(y_test, y_score)
     auc = auc_trapz(fpr, tpr)
 
-    # Confusion matrix at chosen threshold
     pred_threshold = st.slider("Decision threshold", 0.05, 0.95, 0.50, 0.05)
     y_pred = (y_score >= pred_threshold).astype(int)
 
@@ -541,7 +609,6 @@ else:
     m4.metric("Recall", f"{recall:.3f}")
 
     c1, c2 = st.columns(2)
-
     with c1:
         roc_df = pd.DataFrame({"FPR": fpr, "TPR": tpr})
         fig = px.line(roc_df, x="FPR", y="TPR", title="ROC Curve")
@@ -559,30 +626,33 @@ else:
         fig = px.imshow(cm, text_auto=True, aspect="auto", title="Confusion Matrix")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Feature importance: absolute standardized coefficients
     feat_names = X.columns.tolist()
     imp = np.abs(w)
     imp_df = pd.DataFrame({"feature": feat_names, "importance": imp}).sort_values("importance", ascending=False).head(20)
 
-    fig = px.bar(imp_df, x="importance", y="feature", orientation="h",
-                 title="Feature Importance (|coefficient| on standardized features)")
+    fig = px.bar(
+        imp_df,
+        x="importance",
+        y="feature",
+        orientation="h",
+        title="Feature Importance (|coefficient| on standardized features)",
+    )
     fig.update_layout(yaxis={"categoryorder": "total ascending"})
     st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("Model details (what this means)"):
+    with st.expander("Model details"):
         st.write(
             """
-This is a simple logistic regression classifier trained on the filtered dataset (after optional outlier exclusion).
+This classifier is a simple logistic regression trained on the filtered dataset (after optional outlier exclusion).
 
 **Label**: high_curtailment_event = 1 if curtailment_rate ≥ selected threshold.
 
-**Features** include:
+**Features**:
 - Grid emissions intensity (proxy for grid conditions),
 - Weather (irradiance / wind speed / rainfall),
 - Operations (downtime, capacity),
 - Technology and region (one-hot encoded).
 
-**Feature importance** shown here is the absolute value of standardized coefficients.
-Bigger means the model relies more on that feature to separate high-curtailment vs normal days.
+**Feature importance** is shown as the absolute value of standardized coefficients.
 """
         )
