@@ -53,6 +53,21 @@ def add_outlier_flag(df: pd.DataFrame, col: str, group_cols=None, k: float = 1.5
     return df
 
 
+def insight_box(title: str, bullets: list[str]):
+    """Consistent business-insight callout under charts."""
+    st.markdown(
+        f"""
+<div style="border:1px solid #e6e6e6; border-radius:10px; padding:12px; background:#fafafa">
+<b>{title}</b>
+<ul>
+{''.join([f"<li>{b}</li>" for b in bullets])}
+</ul>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 # -----------------------------
 # ML helpers (no sklearn/scipy)
 # -----------------------------
@@ -69,10 +84,6 @@ def standardize(X):
 
 
 def train_logreg(X, y, lr=0.1, steps=2000, reg=1e-3):
-    """
-    L2-regularized logistic regression via gradient descent.
-    X should be standardized.
-    """
     n, p = X.shape
     w = np.zeros(p, dtype="float64")
     b = 0.0
@@ -166,9 +177,7 @@ maybe_generate_data()
 plants, gen, grid, weather, ef = load_data()
 
 st.title("Green Energy – Sustainability + ML Dashboard")
-st.caption(
-    "Part-to-whole views, distributions, heatmaps, outliers, business insights, and a classifier (ROC/CM/feature importance) for high curtailment events."
-)
+st.caption("Business insights are shown directly under each key visual for decision-making.")
 
 # -----------------------------
 # Sidebar filters
@@ -230,7 +239,6 @@ if baseline == "Grid_Average":
 else:
     factor = float(ef.loc[ef["baseline"] == baseline, "emission_factor_kgco2_per_kwh"].iloc[0])
     intensity_kg_per_kwh = factor
-
 dff["avoided_co2_tonnes"] = (dff["net_generation_mwh"] * 1000.0 * intensity_kg_per_kwh) / 1000.0
 
 # Outlier flags (per technology)
@@ -244,11 +252,10 @@ dff["is_any_outlier"] = (
     dff["is_outlier_downtime_hours"] |
     dff["is_outlier_capacity_factor"]
 )
-
 dff_agg = dff.loc[~dff["is_any_outlier"]].copy() if exclude_outliers else dff.copy()
 
 # -----------------------------
-# KPIs
+# KPIs (top row)
 # -----------------------------
 total_net_mwh = float(dff_agg["net_generation_mwh"].sum())
 total_gross_mwh = float(dff_agg["gross_generation_mwh"].sum())
@@ -273,88 +280,24 @@ k7.metric("Avg Availability", f"{avg_avail:.2%}")
 k8.metric("Outlier Rows", f"{int(dff['is_any_outlier'].sum()):,}")
 k9.metric("Outlier %", f"{outlier_pct:.2%}")
 
-st.markdown("---")
-
-# -----------------------------
-# Business insights (actionable)
-# -----------------------------
-st.subheader("Executive Business Insights (Actionable)")
-
+# KPI insights
 avg_price = float(dff_agg["price_per_mwh"].mean()) if len(dff_agg) else 0.0
-lost_mwh_curt = float(dff_agg["curtailment_mwh"].sum())
-estimated_lost_revenue = lost_mwh_curt * avg_price
-
-# Estimate downtime-related lost MWh by scaling net by availability (rough proxy)
-avail = dff_agg["availability"].clip(lower=0.05, upper=1.0)
-potential_net_if_no_downtime = float((dff_agg["net_generation_mwh"] / avail).sum())
-current_net = float(dff_agg["net_generation_mwh"].sum())
-lost_due_to_downtime_mwh = max(0.0, potential_net_if_no_downtime - current_net)
-
-downtime_reduction = st.slider("Assumed downtime reduction (%)", 0, 50, 20, 5) / 100.0
-recoverable_mwh = lost_due_to_downtime_mwh * downtime_reduction
-recoverable_revenue = recoverable_mwh * avg_price
-
-carbon_price = st.number_input("Carbon price (per tonne CO₂)", min_value=0.0, value=50.0, step=10.0)
-avoided_t = float(dff_agg["avoided_co2_tonnes"].sum())
-carbon_value = avoided_t * carbon_price
-
-plant_gen = (
-    dff_agg.groupby("plant_id", as_index=False)["net_generation_mwh"]
-    .sum()
-    .sort_values("net_generation_mwh", ascending=False)
+estimated_lost_revenue = float(dff_agg["curtailment_mwh"].sum()) * avg_price
+insight_box(
+    "Business insight (KPIs)",
+    [
+        f"Estimated revenue lost due to curtailment (using avg price): {estimated_lost_revenue:,.0f}.",
+        "Use the curtailment rate KPI to distinguish grid constraints vs plant performance.",
+        "Use capacity factor + availability together to separate resource variability from operational reliability.",
+    ],
 )
-top_n = st.slider("Top N plants for concentration check", 1, 5, 2)
-top_share = (plant_gen.head(top_n)["net_generation_mwh"].sum() / plant_gen["net_generation_mwh"].sum()) if len(plant_gen) else 0.0
-
-i1, i2, i3, i4 = st.columns(4)
-i1.metric("Estimated Lost Revenue (Curtailment)", f"{estimated_lost_revenue:,.0f}")
-i2.metric("Recoverable Revenue (Downtime reduction)", f"{recoverable_revenue:,.0f}")
-i3.metric("Avoided CO₂ Value (carbon price)", f"{carbon_value:,.0f}")
-i4.metric(f"Generation Concentration (Top {top_n} plants)", f"{top_share:.1%}")
-
-st.caption(
-    "Notes: Curtailment lost revenue uses average price. Downtime recovery assumes generation scales inversely with availability."
-)
-
-risk = dff_agg.groupby(["plant_id", "technology", "region"], as_index=False).agg(
-    net_generation_mwh=("net_generation_mwh", "sum"),
-    avg_capacity_factor=("capacity_factor", "mean"),
-    avg_availability=("availability", "mean"),
-    curtailment_mwh=("curtailment_mwh", "sum"),
-    gross_generation_mwh=("gross_generation_mwh", "sum"),
-    avg_downtime=("downtime_hours", "mean"),
-)
-risk["curtailment_rate"] = np.where(risk["gross_generation_mwh"] > 0, risk["curtailment_mwh"] / risk["gross_generation_mwh"], 0.0)
-
-# Simple risk score: higher is worse
-risk["risk_score"] = (
-    2.0 * risk["curtailment_rate"] +
-    1.0 * (1 - risk["avg_availability"]) +
-    1.0 * (1 - risk["avg_capacity_factor"])
-)
-
-st.markdown("### Plants to Review (highest risk score)")
-st.dataframe(
-    risk.sort_values("risk_score", ascending=False).head(10),
-    use_container_width=True,
-    hide_index=True
-)
-
-worst = risk.sort_values("risk_score", ascending=False).head(1)
-if len(worst):
-    row = worst.iloc[0]
-    st.info(
-        f"Recommendation: Prioritize investigation for **{row['plant_id']}** "
-        f"({row['technology']}, {row['region']}). "
-        f"It has a comparatively higher risk score driven by curtailment and/or availability and capacity factor."
-    )
 
 st.markdown("---")
 
 # -----------------------------
-# Part-to-whole (pie/donut)
+# Part-to-whole (each chart gets its own insight)
 # -----------------------------
-st.subheader("Part-to-Whole Relationships (Portfolio Composition)")
+st.subheader("Part-to-Whole Relationships")
 
 mix_gen = dff_agg.groupby("technology", as_index=False)["net_generation_mwh"].sum()
 mix_rev = dff_agg.groupby("technology", as_index=False)["revenue"].sum()
@@ -363,67 +306,86 @@ mix_curt = dff_agg.groupby("technology", as_index=False)["curtailment_mwh"].sum(
 mix_region_gen = dff_agg.groupby("region", as_index=False)["net_generation_mwh"].sum()
 mix_region_curt = dff_agg.groupby("region", as_index=False)["curtailment_mwh"].sum()
 
-p1, p2, p3 = st.columns(3)
-with p1:
-    st.plotly_chart(px.pie(mix_gen, names="technology", values="net_generation_mwh", title="Generation Mix (by Technology)"),
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.plotly_chart(px.pie(mix_gen, names="technology", values="net_generation_mwh", title="Generation Mix (Technology)"),
                     use_container_width=True)
-with p2:
-    st.plotly_chart(px.pie(mix_rev, names="technology", values="revenue", title="Revenue Mix (by Technology)"),
+    top = mix_gen.sort_values("net_generation_mwh", ascending=False).head(1)
+    top_txt = f"{top.iloc[0]['technology']} ({top.iloc[0]['net_generation_mwh']/mix_gen['net_generation_mwh'].sum():.1%})" if len(top) else "N/A"
+    insight_box("Business insight", [f"Generation is driven primarily by: {top_txt}.", "Concentration indicates where operational focus yields biggest impact."])
+
+with c2:
+    st.plotly_chart(px.pie(mix_rev, names="technology", values="revenue", title="Revenue Mix (Technology)"),
                     use_container_width=True)
-with p3:
+    top = mix_rev.sort_values("revenue", ascending=False).head(1)
+    top_txt = f"{top.iloc[0]['technology']} ({top.iloc[0]['revenue']/mix_rev['revenue'].sum():.1%})" if len(top) else "N/A"
+    insight_box("Business insight", [f"Revenue is concentrated in: {top_txt}.", "Mismatch between revenue mix and generation mix suggests price or contract differences."])
+
+with c3:
     st.plotly_chart(px.pie(mix_co2, names="technology", values="avoided_co2_tonnes", title=f"Avoided CO₂ Mix ({baseline})"),
                     use_container_width=True)
+    top = mix_co2.sort_values("avoided_co2_tonnes", ascending=False).head(1)
+    top_txt = f"{top.iloc[0]['technology']} ({top.iloc[0]['avoided_co2_tonnes']/mix_co2['avoided_co2_tonnes'].sum():.1%})" if len(top) else "N/A"
+    insight_box("Business insight", [f"Most avoided CO₂ comes from: {top_txt}.", "Use this for ESG reporting and impact storytelling."])
 
-p4, p5, p6 = st.columns(3)
-with p4:
+c4, c5, c6 = st.columns(3)
+with c4:
     st.plotly_chart(px.pie(mix_curt, names="technology", values="curtailment_mwh", title="Curtailment Share (Donut)", hole=0.45),
                     use_container_width=True)
-with p5:
-    st.plotly_chart(px.pie(mix_region_gen, names="region", values="net_generation_mwh", title="Generation Mix (by Region)"),
+    top = mix_curt.sort_values("curtailment_mwh", ascending=False).head(1)
+    top_txt = f"{top.iloc[0]['technology']} ({top.iloc[0]['curtailment_mwh']/mix_curt['curtailment_mwh'].sum():.1%})" if len(top) else "N/A"
+    insight_box("Business insight", [f"Curtailment is highest for: {top_txt}.", "Prioritize storage/grid solutions where curtailment is concentrated."])
+
+with c5:
+    st.plotly_chart(px.pie(mix_region_gen, names="region", values="net_generation_mwh", title="Generation Mix (Region)"),
                     use_container_width=True)
-with p6:
-    st.plotly_chart(px.pie(mix_region_curt, names="region", values="curtailment_mwh", title="Curtailment Mix (by Region)", hole=0.45),
+    top = mix_region_gen.sort_values("net_generation_mwh", ascending=False).head(1)
+    top_txt = f"{top.iloc[0]['region']} ({top.iloc[0]['net_generation_mwh']/mix_region_gen['net_generation_mwh'].sum():.1%})" if len(top) else "N/A"
+    insight_box("Business insight", [f"Generation is most concentrated in: {top_txt}.", "Regional concentration may create exposure to local grid constraints."])
+
+with c6:
+    st.plotly_chart(px.pie(mix_region_curt, names="region", values="curtailment_mwh", title="Curtailment Mix (Region)", hole=0.45),
                     use_container_width=True)
+    top = mix_region_curt.sort_values("curtailment_mwh", ascending=False).head(1)
+    top_txt = f"{top.iloc[0]['region']} ({top.iloc[0]['curtailment_mwh']/mix_region_curt['curtailment_mwh'].sum():.1%})" if len(top) else "N/A"
+    insight_box("Business insight", [f"Grid constraints appear most severe in: {top_txt}.", "Use this to prioritize stakeholder engagement by region."])
 
 st.markdown("---")
 
 # -----------------------------
-# Distributions
+# Distributions (each chart gets its own insight)
 # -----------------------------
 st.subheader("Distributions")
 
 d1, d2 = st.columns(2)
 with d1:
-    fig = px.histogram(dff, x="capacity_factor", color="technology", nbins=40, title="Capacity Factor Distribution (includes outliers)")
+    fig = px.histogram(dff, x="capacity_factor", color="technology", nbins=40, title="Capacity Factor Distribution")
     fig.update_xaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
+    insight_box("Business insight", ["Wide distributions imply higher forecasting uncertainty and variable output.", "Use for benchmarking assets within a technology."])
+
 with d2:
-    fig = px.histogram(dff, x="curtailment_rate", color="technology", nbins=40, title="Curtailment Rate Distribution (includes outliers)")
+    fig = px.histogram(dff, x="curtailment_rate", color="technology", nbins=40, title="Curtailment Rate Distribution")
     fig.update_xaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
+    insight_box("Business insight", ["A heavy right tail indicates rare but severe constraint events.", "Mitigation options: storage, curtailment-aware dispatch, grid upgrades."])
 
 d3, d4 = st.columns(2)
 with d3:
-    st.plotly_chart(px.histogram(dff, x="downtime_hours", color="technology", nbins=30, title="Downtime Hours Distribution (includes outliers)"),
+    st.plotly_chart(px.histogram(dff, x="downtime_hours", color="technology", nbins=30, title="Downtime Hours Distribution"),
                     use_container_width=True)
+    insight_box("Business insight", ["Downtime represents controllable loss (maintenance/reliability).", "Focus on recurring downtime patterns by plant."])
+
 with d4:
     fig = px.box(dff, x="technology", y="capacity_factor", points="outliers", title="Box Plot: Capacity Factor by Technology")
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
-
-d5, d6 = st.columns(2)
-with d5:
-    fig = px.box(dff, x="technology", y="curtailment_rate", points="outliers", title="Box Plot: Curtailment Rate by Technology")
-    fig.update_yaxes(tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
-with d6:
-    st.plotly_chart(px.box(dff, x="technology", y="downtime_hours", points="outliers", title="Box Plot: Downtime Hours by Technology"),
-                    use_container_width=True)
+    insight_box("Business insight", ["Outliers here may indicate abnormal weather, plant issues, or data problems.", "Use IQR settings to tune sensitivity."])
 
 st.markdown("---")
 
 # -----------------------------
-# Trends
+# Trends (each chart gets its own insight)
 # -----------------------------
 st.subheader("Trends")
 
@@ -446,22 +408,28 @@ t1, t2 = st.columns(2)
 with t1:
     st.plotly_chart(px.line(daily, x="date", y=["net_generation_mwh", "net_7d_ma"], title="Net Generation (Daily + 7D MA)"),
                     use_container_width=True)
+    insight_box("Business insight", ["Use the 7-day average to spot structural changes vs daily noise.", "Drops can indicate outages, resource dips, or increased curtailment."])
+
 with t2:
     fig = px.line(daily, x="date", y=["curtailment_rate", "curt_7d_ma"], title="Curtailment Rate (Daily + 7D MA)")
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
+    insight_box("Business insight", ["Sustained increases suggest worsening grid constraints.", "Plan maintenance during high-curtailment periods to reduce opportunity cost."])
 
 t3, t4 = st.columns(2)
 with t3:
     st.plotly_chart(px.line(daily, x="date", y="revenue", title="Revenue (Daily)"), use_container_width=True)
+    insight_box("Business insight", ["Revenue variability may reflect both energy and pricing changes.", "Investigate days where revenue doesn't track generation."])
+
 with t4:
     st.plotly_chart(px.line(daily, x="date", y="avoided_co2_tonnes", title=f"Avoided CO₂ (Daily) – {baseline}"),
                     use_container_width=True)
+    insight_box("Business insight", ["This is the primary ESG impact metric for the selected baseline.", "Use as input for periodic sustainability reporting."])
 
 st.markdown("---")
 
 # -----------------------------
-# Heatmaps
+# Heatmaps (each chart gets its own insight)
 # -----------------------------
 st.subheader("Heatmaps")
 
@@ -481,12 +449,15 @@ with h1:
                     title="Heatmap: Net Generation (Month × Day-of-week)",
                     labels=dict(x="Day of Week", y="Month", color="MWh"))
     st.plotly_chart(fig, use_container_width=True)
+    insight_box("Business insight", ["Shows seasonality + weekly patterns.", "Use to schedule maintenance during lower-output windows."])
+
 with h2:
     fig = px.imshow(hm_curt_pivot, aspect="auto",
                     title="Heatmap: Curtailment Rate (Month × Day-of-week)",
                     labels=dict(x="Day of Week", y="Month", color="Rate"))
     fig.update_coloraxes(colorbar_tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
+    insight_box("Business insight", ["Highlights recurring constraint periods.", "Useful for storage/dispatch planning and grid stakeholder discussions."])
 
 pm = dff_agg.groupby(["plant_id", "month"], as_index=False)["net_generation_mwh"].sum()
 pm_pivot = pm.pivot(index="plant_id", columns="month", values="net_generation_mwh").fillna(0)
@@ -494,11 +465,12 @@ fig = px.imshow(pm_pivot, aspect="auto",
                 title="Heatmap: Net Generation (Plant × Month)",
                 labels=dict(x="Month", y="Plant", color="MWh"))
 st.plotly_chart(fig, use_container_width=True)
+insight_box("Business insight", ["Quickly identifies consistently underperforming plants.", "Use with risk scoring (below) to prioritize investigations."])
 
 st.markdown("---")
 
 # -----------------------------
-# Outlier diagnostics
+# Outlier diagnostics (each chart gets insight)
 # -----------------------------
 st.subheader("Outlier Diagnostics")
 
@@ -513,6 +485,7 @@ with o1:
         title="Net Generation vs Revenue (Outliers highlighted)",
     )
     st.plotly_chart(fig, use_container_width=True)
+    insight_box("Business insight", ["Outliers here can indicate pricing anomalies, data issues, or unusual dispatch outcomes.", "Prioritize high-revenue anomalies for audit."])
 
 with o2:
     fig = px.scatter(
@@ -525,9 +498,21 @@ with o2:
     )
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
+    insight_box("Business insight", ["High curtailment at typical grid intensity may indicate localized congestion.", "Use plant+region drilldown to guide grid engagement."])
 
-outlier_rows = dff[dff["is_any_outlier"]].copy().sort_values(["date", "plant_id"]).head(200)
+risk = dff_agg.groupby(["plant_id", "technology", "region"], as_index=False).agg(
+    net_generation_mwh=("net_generation_mwh", "sum"),
+    avg_capacity_factor=("capacity_factor", "mean"),
+    avg_availability=("availability", "mean"),
+    curtailment_mwh=("curtailment_mwh", "sum"),
+    gross_generation_mwh=("gross_generation_mwh", "sum"),
+    avg_downtime=("downtime_hours", "mean"),
+)
+risk["curtailment_rate"] = np.where(risk["gross_generation_mwh"] > 0, risk["curtailment_mwh"] / risk["gross_generation_mwh"], 0.0)
+risk["risk_score"] = 2.0 * risk["curtailment_rate"] + (1 - risk["avg_availability"]) + (1 - risk["avg_capacity_factor"])
+
 with st.expander("Outlier rows (first 200)"):
+    outlier_rows = dff[dff["is_any_outlier"]].copy().sort_values(["date", "plant_id"]).head(200)
     show_cols = [
         "date", "plant_id", "technology", "region",
         "net_generation_mwh", "capacity_factor", "curtailment_rate",
@@ -537,10 +522,14 @@ with st.expander("Outlier rows (first 200)"):
     ]
     st.dataframe(outlier_rows[show_cols], use_container_width=True, hide_index=True)
 
+st.markdown("### Plants to Review (highest operational + curtailment risk)")
+st.dataframe(risk.sort_values("risk_score", ascending=False).head(10), use_container_width=True, hide_index=True)
+insight_box("Business insight", ["This is an action list: start with the highest risk score plants.", "Risk combines curtailment, availability and capacity factor (tunable weights)."])
+
 st.markdown("---")
 
 # -----------------------------
-# ML: ROC, Confusion Matrix, Feature Importance
+# ML: ROC, Confusion Matrix, Feature Importance (each chart gets insight)
 # -----------------------------
 st.subheader("ML: Predict High Curtailment Events (ROC / Confusion Matrix / Feature Importance)")
 
@@ -588,7 +577,6 @@ else:
     reg = st.slider("L2 regularization", 0.0, 0.01, 0.001, 0.001)
 
     w, b = train_logreg(X_train_s, y_train, lr=lr, steps=steps, reg=reg)
-
     y_score = sigmoid(X_test_s @ w + b)
 
     fpr, tpr = roc_curve_points(y_test, y_score)
@@ -616,43 +604,37 @@ else:
         fig.update_xaxes(range=[0, 1])
         fig.update_yaxes(range=[0, 1])
         st.plotly_chart(fig, use_container_width=True)
+        insight_box("Business insight", ["Higher AUC means better early-warning capability.", "Use threshold tuning to balance false alarms vs missed events."])
 
     with c2:
-        cm = pd.DataFrame(
-            [[TN, FP], [FN, TP]],
-            index=["Actual 0", "Actual 1"],
-            columns=["Pred 0", "Pred 1"],
-        )
+        cm = pd.DataFrame([[TN, FP], [FN, TP]], index=["Actual 0", "Actual 1"], columns=["Pred 0", "Pred 1"])
         fig = px.imshow(cm, text_auto=True, aspect="auto", title="Confusion Matrix")
         st.plotly_chart(fig, use_container_width=True)
+        insight_box("Business insight", ["False negatives = missed high-curtailment days (risk).", "False positives = unnecessary interventions (cost)."])
 
     feat_names = X.columns.tolist()
     imp = np.abs(w)
     imp_df = pd.DataFrame({"feature": feat_names, "importance": imp}).sort_values("importance", ascending=False).head(20)
 
-    fig = px.bar(
-        imp_df,
-        x="importance",
-        y="feature",
-        orientation="h",
-        title="Feature Importance (|coefficient| on standardized features)",
-    )
+    fig = px.bar(imp_df, x="importance", y="feature", orientation="h",
+                 title="Feature Importance (|coefficient| on standardized features)")
     fig.update_layout(yaxis={"categoryorder": "total ascending"})
     st.plotly_chart(fig, use_container_width=True)
+    insight_box("Business insight", ["Top features indicate the strongest drivers of high curtailment in this data.", "Use to target monitoring signals and operational playbooks."])
 
     with st.expander("Model details"):
         st.write(
             """
-This classifier is a simple logistic regression trained on the filtered dataset (after optional outlier exclusion).
+This classifier is a logistic regression trained on the filtered dataset (after optional outlier exclusion).
 
-**Label**: high_curtailment_event = 1 if curtailment_rate ≥ selected threshold.
+Label: high_curtailment_event = 1 if curtailment_rate ≥ selected threshold.
 
-**Features**:
-- Grid emissions intensity (proxy for grid conditions),
+Features:
+- Grid emissions intensity,
 - Weather (irradiance / wind speed / rainfall),
 - Operations (downtime, capacity),
 - Technology and region (one-hot encoded).
 
-**Feature importance** is shown as the absolute value of standardized coefficients.
+Feature importance shown as absolute standardized coefficients.
 """
         )
