@@ -7,16 +7,23 @@ import plotly.express as px
 DATA_DIR = "data"
 WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-st.set_page_config(page_title="Green Energy Sustainability Dashboard", layout="wide")
+st.set_page_config(page_title="Green Energy Sustainability + ML Dashboard", layout="wide")
 
 
 # -----------------------------
-# Helpers
+# Helpers (math / cleaning)
 # -----------------------------
 def safe_div(a, b):
     a = np.asarray(a, dtype="float64")
     b = np.asarray(b, dtype="float64")
     return np.where(b == 0, 0.0, a / b)
+
+
+def format_number(x):
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return str(x)
 
 
 def iqr_bounds(s: pd.Series, k: float = 1.5):
@@ -30,10 +37,6 @@ def iqr_bounds(s: pd.Series, k: float = 1.5):
 
 
 def add_outlier_flag(df: pd.DataFrame, col: str, group_cols=None, k: float = 1.5):
-    """
-    Adds boolean column is_outlier_<col> based on IQR bounds.
-    If group_cols provided, computes bounds per group (recommended: per technology).
-    """
     out_col = f"is_outlier_{col}"
     df[out_col] = False
 
@@ -50,11 +53,71 @@ def add_outlier_flag(df: pd.DataFrame, col: str, group_cols=None, k: float = 1.5
     return df
 
 
-def format_number(x):
-    try:
-        return f"{float(x):,.0f}"
-    except Exception:
-        return str(x)
+# -----------------------------
+# ML helpers (no sklearn)
+# -----------------------------
+def sigmoid(z):
+    z = np.clip(z, -50, 50)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def standardize(X):
+    mu = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma = np.where(sigma == 0, 1.0, sigma)
+    return (X - mu) / sigma, mu, sigma
+
+
+def train_logreg(X, y, lr=0.1, steps=2000, reg=1e-3):
+    """
+    L2-regularized logistic regression via gradient descent.
+    X should be standardized.
+    """
+    n, p = X.shape
+    w = np.zeros(p, dtype="float64")
+    b = 0.0
+
+    for _ in range(int(steps)):
+        z = X @ w + b
+        p_hat = sigmoid(z)
+        dw = (X.T @ (p_hat - y)) / n + reg * w
+        db = np.mean(p_hat - y)
+        w -= lr * dw
+        b -= lr * db
+
+    return w, b
+
+
+def roc_curve_points(y_true, y_score):
+    # thresholds sorted high to low
+    thresholds = np.unique(y_score)[::-1]
+    tprs, fprs = [], []
+    P = int((y_true == 1).sum())
+    N = int((y_true == 0).sum())
+
+    for t in thresholds:
+        y_pred = (y_score >= t).astype(int)
+        TP = int(((y_pred == 1) & (y_true == 1)).sum())
+        FP = int(((y_pred == 1) & (y_true == 0)).sum())
+        TPR = TP / P if P else 0.0
+        FPR = FP / N if N else 0.0
+        tprs.append(TPR)
+        fprs.append(FPR)
+
+    return np.array(fprs, dtype="float64"), np.array(tprs, dtype="float64")
+
+
+def auc_trapz(fpr, tpr):
+    order = np.argsort(fpr)
+    return float(np.trapz(tpr[order], fpr[order]))
+
+
+def confusion_matrix_counts(y_true, y_pred):
+    TP = int(((y_true == 1) & (y_pred == 1)).sum())
+    TN = int(((y_true == 0) & (y_pred == 0)).sum())
+    FP = int(((y_true == 0) & (y_pred == 1)).sum())
+    FN = int(((y_true == 1) & (y_pred == 0)).sum())
+    return TN, FP, FN, TP
 
 
 # -----------------------------
@@ -71,7 +134,6 @@ def maybe_generate_data():
     ]
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
-
     missing = [f for f in required if not os.path.exists(os.path.join(DATA_DIR, f))]
     if missing:
         import generate_datasets
@@ -98,13 +160,13 @@ def load_data():
 
 
 # -----------------------------
-# Load
+# App start
 # -----------------------------
 maybe_generate_data()
 plants, gen, grid, weather, ef = load_data()
 
-st.title("Green Energy – Sustainability Analyst Dashboard")
-st.caption("Pie charts, distributions, heatmaps, and IQR-based outlier detection (no dataset download features).")
+st.title("Green Energy – Sustainability + ML Dashboard")
+st.caption("Part-to-whole views, distributions, heatmaps, outliers, and a classifier (ROC/CM/feature importance) for high curtailment events.")
 
 # -----------------------------
 # Sidebar filters
@@ -149,29 +211,32 @@ mask = (
 )
 dff = gen.loc[mask].copy()
 
+# derived time features
 dff["month"] = dff["date"].dt.to_period("M").astype(str)
 dff["dow"] = pd.Categorical(dff["date"].dt.day_name(), categories=WEEKDAY_ORDER, ordered=True)
 
+# derived performance metrics
 dff["availability"] = (1 - dff["downtime_hours"] / 24.0).clip(0, 1)
 dff["capacity_factor"] = safe_div(dff["net_generation_mwh"], dff["capacity_mw"] * 24.0)
 dff["curtailment_rate"] = safe_div(dff["curtailment_mwh"], dff["gross_generation_mwh"])
 
+# merge grid intensity
 dff = dff.merge(grid, on="date", how="left")
 
+# avoided CO2
 if baseline == "Grid_Average":
-    intensity_kg_per_kwh = dff["grid_intensity_gco2_per_kwh"] / 1000.0
+    intensity_kg_per_kwh = dff["grid_intensity_gco2_per_kwh"] / 1000.0  # g->kg
 else:
     factor = float(ef.loc[ef["baseline"] == baseline, "emission_factor_kgco2_per_kwh"].iloc[0])
     intensity_kg_per_kwh = factor
 
-dff["avoided_co2_tonnes"] = (dff["net_generation_mwh"] * 1000.0 * intensity_kg_per_kwh) / 1000.0
+dff["avoided_co2_tonnes"] = (dff["net_generation_mwh"] * 1000.0 * intensity_kg_per_kwh) / 1000.0  # kg->tonnes
 
-# Outlier flags (per technology)
+# outlier flags per technology
 dff = add_outlier_flag(dff, "net_generation_mwh", group_cols=["technology"], k=outlier_k)
 dff = add_outlier_flag(dff, "curtailment_rate", group_cols=["technology"], k=outlier_k)
 dff = add_outlier_flag(dff, "downtime_hours", group_cols=["technology"], k=outlier_k)
 dff = add_outlier_flag(dff, "capacity_factor", group_cols=["technology"], k=outlier_k)
-
 dff["is_any_outlier"] = (
     dff["is_outlier_net_generation_mwh"] |
     dff["is_outlier_curtailment_rate"] |
@@ -210,31 +275,46 @@ k9.metric("Outlier %", f"{outlier_pct:.2%}")
 st.markdown("---")
 
 # -----------------------------
-# Pie / Donut charts
+# Part-to-whole (pie/donut)
 # -----------------------------
-st.subheader("Composition (Pie / Donut Charts)")
+st.subheader("Part-to-Whole Relationships (Portfolio Composition)")
 
 mix_gen = dff_agg.groupby("technology", as_index=False)["net_generation_mwh"].sum()
 mix_rev = dff_agg.groupby("technology", as_index=False)["revenue"].sum()
 mix_co2 = dff_agg.groupby("technology", as_index=False)["avoided_co2_tonnes"].sum()
 mix_curt = dff_agg.groupby("technology", as_index=False)["curtailment_mwh"].sum()
 
-p1, p2, p3, p4 = st.columns(4)
+mix_region_gen = dff_agg.groupby("region", as_index=False)["net_generation_mwh"].sum()
+mix_region_curt = dff_agg.groupby("region", as_index=False)["curtailment_mwh"].sum()
+
+p1, p2, p3 = st.columns(3)
 with p1:
-    st.plotly_chart(px.pie(mix_gen, names="technology", values="net_generation_mwh", title="Generation Mix"), use_container_width=True)
+    st.plotly_chart(px.pie(mix_gen, names="technology", values="net_generation_mwh", title="Generation Mix (by Technology)"),
+                    use_container_width=True)
 with p2:
-    st.plotly_chart(px.pie(mix_rev, names="technology", values="revenue", title="Revenue Mix"), use_container_width=True)
+    st.plotly_chart(px.pie(mix_rev, names="technology", values="revenue", title="Revenue Mix (by Technology)"),
+                    use_container_width=True)
 with p3:
-    st.plotly_chart(px.pie(mix_co2, names="technology", values="avoided_co2_tonnes", title=f"Avoided CO₂ Mix ({baseline})"), use_container_width=True)
+    st.plotly_chart(px.pie(mix_co2, names="technology", values="avoided_co2_tonnes", title=f"Avoided CO₂ Mix ({baseline})"),
+                    use_container_width=True)
+
+p4, p5, p6 = st.columns(3)
 with p4:
-    st.plotly_chart(px.pie(mix_curt, names="technology", values="curtailment_mwh", title="Curtailment Share (Donut)", hole=0.45), use_container_width=True)
+    st.plotly_chart(px.pie(mix_curt, names="technology", values="curtailment_mwh", title="Curtailment Share (Donut)", hole=0.45),
+                    use_container_width=True)
+with p5:
+    st.plotly_chart(px.pie(mix_region_gen, names="region", values="net_generation_mwh", title="Generation Mix (by Region)"),
+                    use_container_width=True)
+with p6:
+    st.plotly_chart(px.pie(mix_region_curt, names="region", values="curtailment_mwh", title="Curtailment Mix (by Region)", hole=0.45),
+                    use_container_width=True)
 
 st.markdown("---")
 
 # -----------------------------
-# Distribution charts
+# Distributions
 # -----------------------------
-st.subheader("Distributions (Histograms + Box Plots)")
+st.subheader("Distributions")
 
 d1, d2 = st.columns(2)
 with d1:
@@ -242,8 +322,8 @@ with d1:
     fig.update_xaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
 with d2:
-    fig = px.box(dff, x="technology", y="capacity_factor", points="outliers", title="Box Plot: Capacity Factor by Technology")
-    fig.update_yaxes(tickformat=".0%")
+    fig = px.histogram(dff, x="curtailment_rate", color="technology", nbins=40, title="Curtailment Rate Distribution (includes outliers)")
+    fig.update_xaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
 
 d3, d4 = st.columns(2)
@@ -251,18 +331,18 @@ with d3:
     st.plotly_chart(px.histogram(dff, x="downtime_hours", color="technology", nbins=30, title="Downtime Hours Distribution (includes outliers)"),
                     use_container_width=True)
 with d4:
-    st.plotly_chart(px.box(dff, x="technology", y="downtime_hours", points="outliers", title="Box Plot: Downtime Hours by Technology"),
-                    use_container_width=True)
+    fig = px.box(dff, x="technology", y="capacity_factor", points="outliers", title="Box Plot: Capacity Factor by Technology")
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
 
 d5, d6 = st.columns(2)
 with d5:
-    fig = px.histogram(dff, x="curtailment_rate", color="technology", nbins=40, title="Curtailment Rate Distribution (includes outliers)")
-    fig.update_xaxes(tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
-with d6:
     fig = px.box(dff, x="technology", y="curtailment_rate", points="outliers", title="Box Plot: Curtailment Rate by Technology")
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
+with d6:
+    st.plotly_chart(px.box(dff, x="technology", y="downtime_hours", points="outliers", title="Box Plot: Downtime Hours by Technology"),
+                    use_container_width=True)
 
 st.markdown("---")
 
@@ -341,7 +421,7 @@ st.plotly_chart(fig, use_container_width=True)
 st.markdown("---")
 
 # -----------------------------
-# Outlier views
+# Outlier diagnostics
 # -----------------------------
 st.subheader("Outlier Diagnostics")
 
@@ -352,7 +432,7 @@ with o1:
         x="net_generation_mwh",
         y="revenue",
         color="outlier",
-        hover_data=["date", "plant_id", "technology"],
+        hover_data=["date", "plant_id", "technology", "region"],
         title="Net Generation vs Revenue (Outliers highlighted)",
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -363,7 +443,7 @@ with o2:
         x="grid_intensity_gco2_per_kwh",
         y="curtailment_rate",
         color="outlier",
-        hover_data=["date", "plant_id", "technology"],
+        hover_data=["date", "plant_id", "technology", "region"],
         title="Curtailment Rate vs Grid Intensity (Outliers highlighted)",
     )
     fig.update_yaxes(tickformat=".0%")
@@ -383,45 +463,126 @@ with st.expander("Outlier rows (first 200)"):
 st.markdown("---")
 
 # -----------------------------
-# Drivers
+# ML: ROC, Confusion Matrix, Feature Importance
 # -----------------------------
-st.subheader("Drivers (Weather vs Generation)")
+st.subheader("ML: Predict High Curtailment Events (ROC / Confusion Matrix / Feature Importance)")
 
-dff_w = dff_agg.merge(weather, on=["date", "region"], how="left")
-driver_daily = dff_w.groupby(["date", "technology"], as_index=False).agg(
-    net_generation_mwh=("net_generation_mwh", "sum"),
-    solar_irradiance_kwh_m2=("solar_irradiance_kwh_m2", "mean"),
-    wind_speed_m_s=("wind_speed_m_s", "mean"),
-    rainfall_mm=("rainfall_mm", "mean"),
-)
+# Build modeling dataframe (join weather)
+model_df = dff_agg.merge(weather, on=["date", "region"], how="left").copy()
 
-dc1, dc2 = st.columns(2)
-with dc1:
-    tech_for_driver = st.selectbox("Select technology for driver plot", sorted(driver_daily["technology"].unique()))
-    dd = driver_daily[driver_daily["technology"] == tech_for_driver].copy()
+# Label definition
+threshold = st.slider("High curtailment event threshold (curtailment rate)", 0.02, 0.20, 0.08, 0.01)
+model_df["high_curtailment_event"] = (model_df["curtailment_rate"] >= threshold).astype(int)
 
-    if tech_for_driver == "Solar":
-        st.plotly_chart(px.scatter(dd, x="solar_irradiance_kwh_m2", y="net_generation_mwh",
-                                   title="Solar: Irradiance vs Net Generation"),
-                        use_container_width=True)
-    elif tech_for_driver == "Wind":
-        st.plotly_chart(px.scatter(dd, x="wind_speed_m_s", y="net_generation_mwh",
-                                   title="Wind: Wind Speed vs Net Generation"),
-                        use_container_width=True)
-    elif tech_for_driver == "Hydro":
-        st.plotly_chart(px.scatter(dd, x="rainfall_mm", y="net_generation_mwh",
-                                   title="Hydro: Rainfall vs Net Generation"),
-                        use_container_width=True)
-    else:
-        st.plotly_chart(px.scatter(dd, x="rainfall_mm", y="net_generation_mwh",
-                                   title="Biomass: Rainfall vs Net Generation"),
-                        use_container_width=True)
+# Feature set
+num_features = [
+    "grid_intensity_gco2_per_kwh",
+    "solar_irradiance_kwh_m2",
+    "wind_speed_m_s",
+    "rainfall_mm",
+    "downtime_hours",
+    "capacity_mw",
+]
+num_features = [c for c in num_features if c in model_df.columns]
 
-with dc2:
-    st.markdown("**How to use this dashboard**")
-    st.write(
-        "- Pie charts: portfolio composition.\n"
-        "- Distributions: variability and typical ranges.\n"
-        "- Heatmaps: seasonality + weekday patterns.\n"
-        "- Outliers: potential incidents (downtime) or grid constraints (curtailment)."
-    )
+X_num = model_df[num_features].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+X_cat = pd.get_dummies(model_df[["technology", "region"]], drop_first=True)
+X = pd.concat([X_num, X_cat], axis=1)
+y = model_df["high_curtailment_event"].values.astype(int)
+
+# Enough data guardrails
+if len(X) < 200 or int(y.sum()) < 10 or int((y == 0).sum()) < 10:
+    st.warning("Not enough rows/events in the current filters to train/evaluate the classifier. Expand date range / plants / regions.")
+else:
+    # Train/test split
+    test_pct = st.slider("Test size (%)", 10, 40, 25, 5) / 100.0
+    rng = np.random.default_rng(7)
+    idx = np.arange(len(X))
+    rng.shuffle(idx)
+    split = int(len(X) * (1 - test_pct))
+    train_idx, test_idx = idx[:split], idx[split:]
+
+    X_train = X.values[train_idx]
+    X_test = X.values[test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+
+    # Standardize
+    X_train_s, mu, sigma = standardize(X_train)
+    X_test_s = (X_test - mu) / sigma
+
+    # Train model
+    lr = st.slider("Learning rate", 0.01, 0.5, 0.10, 0.01)
+    steps = st.slider("Training steps", 500, 5000, 2000, 500)
+    reg = st.slider("L2 regularization", 0.0, 0.01, 0.001, 0.001)
+
+    w, b = train_logreg(X_train_s, y_train, lr=lr, steps=steps, reg=reg)
+
+    # Scores / predictions
+    y_score = sigmoid(X_test_s @ w + b)
+
+    # ROC + AUC
+    fpr, tpr = roc_curve_points(y_test, y_score)
+    auc = auc_trapz(fpr, tpr)
+
+    # Confusion matrix at chosen threshold
+    pred_threshold = st.slider("Decision threshold", 0.05, 0.95, 0.50, 0.05)
+    y_pred = (y_score >= pred_threshold).astype(int)
+
+    TN, FP, FN, TP = confusion_matrix_counts(y_test, y_pred)
+    acc = (TP + TN) / (TP + TN + FP + FN)
+    precision = TP / (TP + FP) if (TP + FP) else 0.0
+    recall = TP / (TP + FN) if (TP + FN) else 0.0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("AUC", f"{auc:.3f}")
+    m2.metric("Accuracy", f"{acc:.3f}")
+    m3.metric("Precision", f"{precision:.3f}")
+    m4.metric("Recall", f"{recall:.3f}")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        roc_df = pd.DataFrame({"FPR": fpr, "TPR": tpr})
+        fig = px.line(roc_df, x="FPR", y="TPR", title="ROC Curve")
+        fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(dash="dash"))
+        fig.update_xaxes(range=[0, 1])
+        fig.update_yaxes(range=[0, 1])
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        cm = pd.DataFrame(
+            [[TN, FP], [FN, TP]],
+            index=["Actual 0", "Actual 1"],
+            columns=["Pred 0", "Pred 1"],
+        )
+        fig = px.imshow(cm, text_auto=True, aspect="auto", title="Confusion Matrix")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Feature importance: absolute standardized coefficients
+    feat_names = X.columns.tolist()
+    imp = np.abs(w)
+    imp_df = pd.DataFrame({"feature": feat_names, "importance": imp}).sort_values("importance", ascending=False).head(20)
+
+    fig = px.bar(imp_df, x="importance", y="feature", orientation="h",
+                 title="Feature Importance (|coefficient| on standardized features)")
+    fig.update_layout(yaxis={"categoryorder": "total ascending"})
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Model details (what this means)"):
+        st.write(
+            """
+This is a simple logistic regression classifier trained on the filtered dataset (after optional outlier exclusion).
+
+**Label**: high_curtailment_event = 1 if curtailment_rate ≥ selected threshold.
+
+**Features** include:
+- Grid emissions intensity (proxy for grid conditions),
+- Weather (irradiance / wind speed / rainfall),
+- Operations (downtime, capacity),
+- Technology and region (one-hot encoded).
+
+**Feature importance** shown here is the absolute value of standardized coefficients.
+Bigger means the model relies more on that feature to separate high-curtailment vs normal days.
+"""
+        )
