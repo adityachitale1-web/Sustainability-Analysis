@@ -1,12 +1,11 @@
 import os
-import io
-import zipfile
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
 DATA_DIR = "data"
+WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 st.set_page_config(page_title="Green Energy Sustainability Dashboard", layout="wide")
 
@@ -14,18 +13,6 @@ st.set_page_config(page_title="Green Energy Sustainability Dashboard", layout="w
 # -----------------------------
 # Helpers
 # -----------------------------
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-
-def make_zip_from_dfs(dfs: dict) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for filename, df in dfs.items():
-            zf.writestr(filename, df.to_csv(index=False))
-    return buf.getvalue()
-
-
 def safe_div(a, b):
     a = np.asarray(a, dtype="float64")
     b = np.asarray(b, dtype="float64")
@@ -44,14 +31,14 @@ def iqr_bounds(s: pd.Series, k: float = 1.5):
 
 def add_outlier_flag(df: pd.DataFrame, col: str, group_cols=None, k: float = 1.5):
     """
-    Adds boolean column f"is_outlier_{col}" using IQR bounds.
-    If group_cols provided, apply bounds per group (e.g., per technology).
+    Adds boolean column is_outlier_<col> based on IQR bounds.
+    If group_cols provided, computes bounds per group (recommended: per technology).
     """
     out_col = f"is_outlier_{col}"
     df[out_col] = False
 
     if group_cols:
-        for keys, idx in df.groupby(group_cols).groups.items():
+        for _, idx in df.groupby(group_cols).groups.items():
             lo, hi = iqr_bounds(df.loc[idx, col], k=k)
             if pd.notna(lo) and pd.notna(hi):
                 df.loc[idx, out_col] = (df.loc[idx, col] < lo) | (df.loc[idx, col] > hi)
@@ -63,6 +50,16 @@ def add_outlier_flag(df: pd.DataFrame, col: str, group_cols=None, k: float = 1.5
     return df
 
 
+def format_number(x):
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return str(x)
+
+
+# -----------------------------
+# Data generation/loading
+# -----------------------------
 @st.cache_data
 def maybe_generate_data():
     required = [
@@ -100,13 +97,6 @@ def load_data():
     return plants, gen, grid, weather, ef
 
 
-def format_number(x):
-    try:
-        return f"{float(x):,.0f}"
-    except Exception:
-        return str(x)
-
-
 # -----------------------------
 # Load
 # -----------------------------
@@ -114,46 +104,7 @@ maybe_generate_data()
 plants, gen, grid, weather, ef = load_data()
 
 st.title("Green Energy – Sustainability Analyst Dashboard")
-st.caption("Includes heatmaps, outlier detection, operational diagnostics, and sustainability impact metrics.")
-
-# -----------------------------
-# Downloads (main page)
-# -----------------------------
-st.subheader("Download datasets (CSV)")
-
-plants_dl = plants.copy()
-
-gen_dl = gen.copy()
-gen_dl["date"] = pd.to_datetime(gen_dl["date"]).dt.strftime("%Y-%m-%d")
-
-grid_dl = grid.copy()
-grid_dl["date"] = pd.to_datetime(grid_dl["date"]).dt.strftime("%Y-%m-%d")
-
-weather_dl = weather.copy()
-weather_dl["date"] = pd.to_datetime(weather_dl["date"]).dt.strftime("%Y-%m-%d")
-
-ef_dl = ef.copy()
-
-zip_bytes = make_zip_from_dfs({
-    "plants.csv": plants_dl,
-    "generation_daily.csv": gen_dl,
-    "grid_intensity_daily.csv": grid_dl,
-    "weather_daily.csv": weather_dl,
-    "emissions_factors.csv": ef_dl,
-})
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.download_button("Download plants.csv", df_to_csv_bytes(plants_dl), "plants.csv", "text/csv", use_container_width=True)
-    st.download_button("Download emissions_factors.csv", df_to_csv_bytes(ef_dl), "emissions_factors.csv", "text/csv", use_container_width=True)
-with c2:
-    st.download_button("Download generation_daily.csv", df_to_csv_bytes(gen_dl), "generation_daily.csv", "text/csv", use_container_width=True)
-    st.download_button("Download grid_intensity_daily.csv", df_to_csv_bytes(grid_dl), "grid_intensity_daily.csv", "text/csv", use_container_width=True)
-with c3:
-    st.download_button("Download weather_daily.csv", df_to_csv_bytes(weather_dl), "weather_daily.csv", "text/csv", use_container_width=True)
-    st.download_button("Download ALL datasets (ZIP)", zip_bytes, "green_energy_datasets.zip", "application/zip", use_container_width=True)
-
-st.markdown("---")
+st.caption("Includes pie charts, distributions, heatmaps, and IQR-based outlier detection (no extra dependencies).")
 
 # -----------------------------
 # Sidebar filters
@@ -187,7 +138,7 @@ with st.sidebar:
     exclude_outliers = st.checkbox("Exclude outliers from aggregations", value=False)
 
 # -----------------------------
-# Filtered dataset
+# Filter + feature engineering
 # -----------------------------
 mask = (
     (gen["date"].dt.date >= start) &
@@ -198,15 +149,15 @@ mask = (
 )
 dff = gen.loc[mask].copy()
 
-# Derived
 dff["month"] = dff["date"].dt.to_period("M").astype(str)
 dff["dow"] = dff["date"].dt.day_name()
-dff["dow_num"] = dff["date"].dt.weekday
+dff["dow"] = pd.Categorical(dff["dow"], categories=WEEKDAY_ORDER, ordered=True)
+
 dff["availability"] = (1 - dff["downtime_hours"] / 24.0).clip(0, 1)
 dff["capacity_factor"] = safe_div(dff["net_generation_mwh"], dff["capacity_mw"] * 24.0)
 dff["curtailment_rate"] = safe_div(dff["curtailment_mwh"], dff["gross_generation_mwh"])
 
-# Merge grid + avoided CO2
+# Merge grid for avoided CO2
 dff = dff.merge(grid, on="date", how="left")
 
 if baseline == "Grid_Average":
@@ -217,15 +168,17 @@ else:
 
 dff["avoided_co2_tonnes"] = (dff["net_generation_mwh"] * 1000.0 * intensity_kg_per_kwh) / 1000.0
 
-# Outlier flags (per technology so Solar/Wind/Hydro aren't compared unfairly)
+# Outlier flags (per technology)
 dff = add_outlier_flag(dff, "net_generation_mwh", group_cols=["technology"], k=outlier_k)
 dff = add_outlier_flag(dff, "curtailment_rate", group_cols=["technology"], k=outlier_k)
 dff = add_outlier_flag(dff, "downtime_hours", group_cols=["technology"], k=outlier_k)
+dff = add_outlier_flag(dff, "capacity_factor", group_cols=["technology"], k=outlier_k)
 
 dff["is_any_outlier"] = (
     dff["is_outlier_net_generation_mwh"] |
     dff["is_outlier_curtailment_rate"] |
-    dff["is_outlier_downtime_hours"]
+    dff["is_outlier_downtime_hours"] |
+    dff["is_outlier_capacity_factor"]
 )
 
 dff_agg = dff.loc[~dff["is_any_outlier"]].copy() if exclude_outliers else dff.copy()
@@ -241,6 +194,7 @@ total_revenue = float(dff_agg["revenue"].sum())
 total_avoided = float(dff_agg["avoided_co2_tonnes"].sum())
 avg_cf = float(dff_agg["capacity_factor"].mean()) if len(dff_agg) else 0.0
 avg_avail = float(dff_agg["availability"].mean()) if len(dff_agg) else 0.0
+outlier_pct = float(dff["is_any_outlier"].mean()) if len(dff) else 0.0
 
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Net Generation (MWh)", format_number(total_net_mwh))
@@ -253,14 +207,118 @@ k6.metric("Avg Capacity Factor", f"{avg_cf:.2%}")
 k7, k8, k9 = st.columns(3)
 k7.metric("Avg Availability", f"{avg_avail:.2%}")
 k8.metric("Outlier Rows", f"{int(dff['is_any_outlier'].sum()):,}")
-k9.metric("Outlier %", f"{(dff['is_any_outlier'].mean() if len(dff) else 0):.2%}")
+k9.metric("Outlier %", f"{outlier_pct:.2%}")
 
 st.markdown("---")
 
 # -----------------------------
-# Trends + rolling averages
+# Pie / Donut charts
 # -----------------------------
-st.subheader("Trends (with rolling averages)")
+st.subheader("Composition (Pie / Donut Charts)")
+
+mix_gen = dff_agg.groupby("technology", as_index=False)["net_generation_mwh"].sum()
+mix_rev = dff_agg.groupby("technology", as_index=False)["revenue"].sum()
+mix_co2 = dff_agg.groupby("technology", as_index=False)["avoided_co2_tonnes"].sum()
+mix_curt = dff_agg.groupby("technology", as_index=False)["curtailment_mwh"].sum()
+
+p1, p2, p3, p4 = st.columns(4)
+
+with p1:
+    fig = px.pie(mix_gen, names="technology", values="net_generation_mwh", title="Generation Mix")
+    st.plotly_chart(fig, use_container_width=True)
+
+with p2:
+    fig = px.pie(mix_rev, names="technology", values="revenue", title="Revenue Mix")
+    st.plotly_chart(fig, use_container_width=True)
+
+with p3:
+    fig = px.pie(mix_co2, names="technology", values="avoided_co2_tonnes", title=f"Avoided CO₂ Mix ({baseline})")
+    st.plotly_chart(fig, use_container_width=True)
+
+with p4:
+    fig = px.pie(mix_curt, names="technology", values="curtailment_mwh", title="Curtailment Share (Donut)", hole=0.45)
+    st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+
+# -----------------------------
+# Distribution charts
+# -----------------------------
+st.subheader("Distributions (Histograms + Box Plots)")
+
+d1, d2 = st.columns(2)
+with d1:
+    fig = px.histogram(
+        dff,
+        x="capacity_factor",
+        color="technology",
+        nbins=40,
+        title="Capacity Factor Distribution (includes outliers)",
+    )
+    fig.update_xaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+with d2:
+    fig = px.box(
+        dff,
+        x="technology",
+        y="capacity_factor",
+        points="outliers",
+        title="Box Plot: Capacity Factor by Technology",
+    )
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+d3, d4 = st.columns(2)
+with d3:
+    fig = px.histogram(
+        dff,
+        x="downtime_hours",
+        color="technology",
+        nbins=30,
+        title="Downtime Hours Distribution (includes outliers)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+with d4:
+    fig = px.box(
+        dff,
+        x="technology",
+        y="downtime_hours",
+        points="outliers",
+        title="Box Plot: Downtime Hours by Technology",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+d5, d6 = st.columns(2)
+with d5:
+    fig = px.histogram(
+        dff,
+        x="curtailment_rate",
+        color="technology",
+        nbins=40,
+        title="Curtailment Rate Distribution (includes outliers)",
+    )
+    fig.update_xaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+with d6:
+    fig = px.box(
+        dff,
+        x="technology",
+        y="curtailment_rate",
+        points="outliers",
+        title="Box Plot: Curtailment Rate by Technology",
+    )
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+
+# -----------------------------
+# Trends + rolling average
+# -----------------------------
+st.subheader("Trends")
 
 daily = dff_agg.groupby("date", as_index=False).agg(
     net_generation_mwh=("net_generation_mwh", "sum"),
@@ -275,25 +333,24 @@ daily = dff_agg.groupby("date", as_index=False).agg(
 daily["curtailment_rate"] = safe_div(daily["curtailment_mwh"], daily["gross_generation_mwh"])
 daily = daily.sort_values("date")
 
-for col in ["net_generation_mwh", "curtailment_rate", "avg_cf", "revenue"]:
-    daily[f"{col}_7d_ma"] = daily[col].rolling(7, min_periods=1).mean()
+daily["net_7d_ma"] = daily["net_generation_mwh"].rolling(7, min_periods=1).mean()
+daily["curt_7d_ma"] = daily["curtailment_rate"].rolling(7, min_periods=1).mean()
 
 t1, t2 = st.columns(2)
 with t1:
-    fig = px.line(daily, x="date", y=["net_generation_mwh", "net_generation_mwh_7d_ma"], title="Net Generation (Daily + 7D MA)")
+    fig = px.line(daily, x="date", y=["net_generation_mwh", "net_7d_ma"], title="Net Generation (Daily + 7D MA)")
     st.plotly_chart(fig, use_container_width=True)
 with t2:
-    fig = px.line(daily, x="date", y=["curtailment_rate", "curtailment_rate_7d_ma"], title="Curtailment Rate (Daily + 7D MA)")
+    fig = px.line(daily, x="date", y=["curtailment_rate", "curt_7d_ma"], title="Curtailment Rate (Daily + 7D MA)")
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
 
 t3, t4 = st.columns(2)
 with t3:
-    fig = px.line(daily, x="date", y=["avg_cf", "avg_cf_7d_ma"], title="Capacity Factor (Avg Daily + 7D MA)")
-    fig.update_yaxes(tickformat=".0%")
+    fig = px.line(daily, x="date", y="revenue", title="Revenue (Daily)")
     st.plotly_chart(fig, use_container_width=True)
 with t4:
-    fig = px.line(daily, x="date", y=["revenue", "revenue_7d_ma"], title="Revenue (Daily + 7D MA)")
+    fig = px.line(daily, x="date", y="avoided_co2_tonnes", title=f"Avoided CO₂ (Daily) – {baseline}")
     st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
@@ -303,147 +360,149 @@ st.markdown("---")
 # -----------------------------
 st.subheader("Heatmaps")
 
-weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-
 hm_gen = dff_agg.groupby(["month", "dow"], as_index=False)["net_generation_mwh"].sum()
-hm_gen["dow"] = pd.Categorical(hm_gen["dow"], categories=weekday_order, ordered=True)
 hm_gen_pivot = hm_gen.pivot(index="month", columns="dow", values="net_generation_mwh").fillna(0)
 
 hm_curt = dff_agg.groupby(["month", "dow"], as_index=False).agg(
     curtailment_mwh=("curtailment_mwh", "sum"),
     gross_generation_mwh=("gross_generation_mwh", "sum"),
 )
-hm_curt["dow"] = pd.Categorical(hm_curt["dow"], categories=weekday_order, ordered=True)
 hm_curt["curtailment_rate"] = safe_div(hm_curt["curtailment_mwh"], hm_curt["gross_generation_mwh"])
 hm_curt_pivot = hm_curt.pivot(index="month", columns="dow", values="curtailment_rate").fillna(0)
 
 h1, h2 = st.columns(2)
 with h1:
     fig = px.imshow(
-        hm_gen_pivot, aspect="auto",
+        hm_gen_pivot,
+        aspect="auto",
         title="Heatmap: Net Generation (Month × Day-of-week)",
-        labels=dict(x="Day of Week", y="Month", color="MWh")
+        labels=dict(x="Day of Week", y="Month", color="MWh"),
     )
     st.plotly_chart(fig, use_container_width=True)
 
 with h2:
     fig = px.imshow(
-        hm_curt_pivot, aspect="auto",
+        hm_curt_pivot,
+        aspect="auto",
         title="Heatmap: Curtailment Rate (Month × Day-of-week)",
-        labels=dict(x="Day of Week", y="Month", color="Rate")
+        labels=dict(x="Day of Week", y="Month", color="Rate"),
     )
     fig.update_coloraxes(colorbar_tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
 
-# Plant x Month heatmap
+# Plant × Month heatmap
 pm = dff_agg.groupby(["plant_id", "month"], as_index=False)["net_generation_mwh"].sum()
 pm_pivot = pm.pivot(index="plant_id", columns="month", values="net_generation_mwh").fillna(0)
 fig = px.imshow(
-    pm_pivot, aspect="auto",
+    pm_pivot,
+    aspect="auto",
     title="Heatmap: Net Generation (Plant × Month)",
-    labels=dict(x="Month", y="Plant", color="MWh")
+    labels=dict(x="Month", y="Plant", color="MWh"),
 )
 st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
 
 # -----------------------------
-# Outlier visualizations
+# Outlier views (graphs + table)
 # -----------------------------
-st.subheader("Outliers & Distributions")
+st.subheader("Outliers")
 
 o1, o2 = st.columns(2)
 with o1:
-    fig = px.box(dff, x="technology", y="capacity_factor", points="outliers", title="Box Plot: Capacity Factor by Technology")
-    fig.update_yaxes(tickformat=".0%")
+    fig = px.scatter(
+        dff.assign(outlier=np.where(dff["is_any_outlier"], "Outlier", "Normal")),
+        x="net_generation_mwh",
+        y="revenue",
+        color="outlier",
+        hover_data=["date", "plant_id", "technology"],
+        title="Net Generation vs Revenue (Outliers highlighted)",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 with o2:
-    fig = px.box(dff, x="technology", y="curtailment_rate", points="outliers", title="Box Plot: Curtailment Rate by Technology")
-    fig.update_yaxes(tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
-
-o3, o4 = st.columns(2)
-with o3:
-    fig = px.histogram(dff, x="downtime_hours", nbins=30, color="technology", title="Downtime Hours Distribution")
-    st.plotly_chart(fig, use_container_width=True)
-
-with o4:
-    fig = px.histogram(dff, x="capacity_factor", nbins=30, color="technology", title="Capacity Factor Distribution")
-    fig.update_xaxes(tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
-
-# Scatter highlighting outliers
-s1, s2 = st.columns(2)
-with s1:
     fig = px.scatter(
         dff.assign(outlier=np.where(dff["is_any_outlier"], "Outlier", "Normal")),
-        x="net_generation_mwh", y="revenue", color="outlier",
+        x="grid_intensity_gco2_per_kwh",
+        y="curtailment_rate",
+        color="outlier",
         hover_data=["date", "plant_id", "technology"],
-        title="Net Generation vs Revenue (Outliers highlighted)"
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-with s2:
-    fig = px.scatter(
-        dff.assign(outlier=np.where(dff["is_any_outlier"], "Outlier", "Normal")),
-        x="grid_intensity_gco2_per_kwh", y="curtailment_rate", color="outlier",
-        hover_data=["date", "plant_id", "technology"],
-        title="Curtailment Rate vs Grid Intensity (Outliers highlighted)"
+        title="Curtailment Rate vs Grid Intensity (Outliers highlighted)",
     )
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
 
-# Outlier table
-outlier_rows = dff[dff["is_any_outlier"]].copy()
-outlier_rows = outlier_rows.sort_values(["date", "plant_id"]).head(200)
+outlier_rows = dff[dff["is_any_outlier"]].copy().sort_values(["date", "plant_id"]).head(200)
 
 with st.expander("Outlier rows (first 200)"):
     show_cols = [
         "date", "plant_id", "technology", "region",
-        "net_generation_mwh", "capacity_factor", "curtailment_rate",
-        "downtime_hours", "grid_intensity_gco2_per_kwh",
-        "is_outlier_net_generation_mwh", "is_outlier_curtailment_rate", "is_outlier_downtime_hours"
+        "net_generation_mwh", "capacity_factor", "curtailment_rate", "downtime_hours",
+        "grid_intensity_gco2_per_kwh",
+        "is_outlier_net_generation_mwh", "is_outlier_capacity_factor",
+        "is_outlier_curtailment_rate", "is_outlier_downtime_hours",
     ]
-    for c in ["capacity_factor", "curtailment_rate"]:
-        if c in outlier_rows.columns:
-            # keep as decimals, but readable
-            pass
     st.dataframe(outlier_rows[show_cols], use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
 # -----------------------------
-# Top constraint days
+# Drivers (optional but useful)
 # -----------------------------
-st.subheader("Grid Constraint Days (Highest Curtailment Rate)")
+st.subheader("Drivers (Weather vs Generation)")
 
-daily_full = dff.groupby("date", as_index=False).agg(
+dff_w = dff_agg.merge(weather, on=["date", "region"], how="left")
+driver_daily = dff_w.groupby(["date", "technology"], as_index=False).agg(
     net_generation_mwh=("net_generation_mwh", "sum"),
-    gross_generation_mwh=("gross_generation_mwh", "sum"),
-    curtailment_mwh=("curtailment_mwh", "sum"),
-    grid_intensity_gco2_per_kwh=("grid_intensity_gco2_per_kwh", "mean"),
+    solar_irradiance_kwh_m2=("solar_irradiance_kwh_m2", "mean"),
+    wind_speed_m_s=("wind_speed_m_s", "mean"),
+    rainfall_mm=("rainfall_mm", "mean"),
 )
-daily_full["curtailment_rate"] = safe_div(daily_full["curtailment_mwh"], daily_full["gross_generation_mwh"])
-top_constraints = daily_full.sort_values("curtailment_rate", ascending=False).head(15)
 
-fig = px.bar(top_constraints, x="date", y="curtailment_rate", title="Top 15 Curtailment Rate Days")
-fig.update_yaxes(tickformat=".0%")
-st.plotly_chart(fig, use_container_width=True)
+dcol1, dcol2 = st.columns(2)
+with dcol1:
+    tech_for_driver = st.selectbox("Select technology for driver plot", sorted(driver_daily["technology"].unique()))
+    dd = driver_daily[driver_daily["technology"] == tech_for_driver].copy()
 
-st.dataframe(top_constraints, use_container_width=True, hide_index=True)
+    if tech_for_driver == "Solar":
+        fig = px.scatter(dd, x="solar_irradiance_kwh_m2", y="net_generation_mwh", title="Solar: Irradiance vs Net Generation")
+        st.plotly_chart(fig, use_container_width=True)
+    elif tech_for_driver == "Wind":
+        fig = px.scatter(dd, x="wind_speed_m_s", y="net_generation_mwh", title="Wind: Wind Speed vs Net Generation")
+        st.plotly_chart(fig, use_container_width=True)
+    elif tech_for_driver == "Hydro":
+        fig = px.scatter(dd, x="rainfall_mm", y="net_generation_mwh", title="Hydro: Rainfall vs Net Generation")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        fig = px.scatter(dd, x="rainfall_mm", y="net_generation_mwh", title="Biomass: Rainfall vs Net Generation")
+        st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------
-# Notes
-# -----------------------------
-with st.expander("What outliers mean here"):
+with dcol2:
+    st.markdown("**Notes**")
+    st.write(
+        "- Use distributions + outlier flags to spot data quality issues.\n"
+        "- Curtailment heatmaps indicate grid constraints patterns.\n"
+        "- Capacity factor distributions help benchmark technologies/plants."
+    )
+
+with st.expander("Data dictionary / assumptions"):
     st.write(
         """
-Outliers are flagged using an IQR rule (per-technology), which helps catch:
-- unusually low/high net generation for a given technology
-- unusual curtailment rates (possible grid congestion events)
-- unusual downtime spikes (possible operational incidents)
+**generation_daily.csv**
+- gross_generation_mwh: generation after availability adjustment
+- curtailment_mwh: energy not delivered due to grid constraints
+- net_generation_mwh: delivered energy (gross - curtailment)
+- downtime_hours: operational downtime
+- price_per_mwh: simulated market price
+- revenue: net_generation_mwh * price_per_mwh
 
-You can choose to exclude outliers from aggregated charts using the sidebar toggle.
+**Derived in dashboard**
+- availability = 1 - downtime_hours/24
+- capacity_factor = net_generation_mwh / (capacity_mw * 24)
+- curtailment_rate = curtailment_mwh / gross_generation_mwh
+
+**Avoided CO₂**
+- Grid_Average uses daily grid intensity (gCO₂/kWh).
+- Coal/Gas use fixed emission factors (kgCO₂/kWh).
 """
     )
